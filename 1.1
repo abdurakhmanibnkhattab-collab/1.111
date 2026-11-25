@@ -1,0 +1,560 @@
+
+================================================================================
+FILE: README.md
+================================================================================
+# Контроль термопечей — исходный проект Android
+
+Первая версия проекта для Android Studio (Kotlin + Jetpack Compose).
+
+## Что реализовано в каркасе
+- 8 печей с редактируемыми названиями (по умолчанию «Печь 1» … «Печь 8»).
+- Независимый таймер для каждой печи.
+- Ввод времени в часах и минутах; отсчёт начинается сразу после нажатия «Запустить».
+- Повторяющийся звуковой сигнал после окончания времени до подтверждения «Выгружено»; если ожидают несколько печей, сигнал прекращается только после подтверждения всех.
+- Состояние таймеров сохраняется локально; незавершённые таймеры восстанавливаются после перезагрузки телефона.
+- Нет журнала истории.
+
+## Как открыть
+1. Установите Android Studio.
+2. Откройте папку проекта `HeatFurnaceControl`.
+3. Дождитесь синхронизации Gradle.
+4. Запустите на Android-телефоне или соберите APK через Build → Build APK(s).
+
+## Важные замечания перед эксплуатацией
+Это стартовый прототип, а не сертифицированная промышленная система. На разных моделях Android производитель может ограничивать фоновые сигналы и точные будильники. При первом запуске разрешите уведомления; в настройках Android разрешите приложению точные будильники, если система попросит. Проверьте работу на конкретном телефоне, в том числе при заблокированном экране и после перезагрузки.
+
+Сигнал уведомления зависит от настроек канала уведомлений Android. Для гарантированного слышимого оповещения настройте для канала «Окончание обработки» громкий звук и не отключайте уведомления. Приложение не управляет печами и не является защитной системой оборудования.
+
+## Повторяющийся сигнал
+При окончании таймера запускается foreground service с циклическим системным сигналом. Подтверждение «Выгружено» прекращает сигнал, когда не осталось других печей, ожидающих выгрузки. На Android/HiOS необходимо проверить работу службы и разрешить уведомления, автозапуск и фоновую работу. Если пользователь принудительно остановит приложение или система ограничит службу, сигнал может прерваться; обязательна проверка на целевом устройстве.
+
+
+## Обновление интерфейса и сигнала (версия 1.1)
+- Время задаётся одним числовым полем в минутах.
+- Добавлен выбор мелодии: сигнал будильника, мелодия звонка или звук уведомления (доступные системные варианты устройства).
+- Фоновый сервис использует воспроизведение с назначением AUDIO USAGE_ALARM и частичный WakeLock, чтобы звук не зависел от погашенного экрана.
+- Если время истекло, но событие ещё обрабатывается, вместо нулевого таймера отображается «ЗАВЕРШЕНИЕ…».
+
+Обязательно проверить на конкретном TECNO/HiOS: заблокированный экран, режим «Не беспокоить», громкость будильника, ограничения фоновой работы и одновременное завершение нескольких таймеров. Android и прошивка производителя могут ограничивать фоновые службы; приложение не является сертифицированной системой промышленной безопасности.
+
+
+================================================================================
+FILE: app/build.gradle.kts
+================================================================================
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+}
+android {
+    namespace = "com.example.furnacecontrol"
+    compileSdk = 36
+    defaultConfig {
+        applicationId = "com.example.furnacecontrol"
+        minSdk = 26
+        targetSdk = 35
+        versionCode = 2
+        versionName = "1.1"
+    }
+    buildFeatures { compose = true }
+}
+dependencies {
+    implementation("androidx.core:core-ktx:1.17.0")
+    implementation("androidx.activity:activity-compose:1.11.0")
+    implementation(platform("androidx.compose:compose-bom:2025.10.00"))
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.9.4")
+    debugImplementation("androidx.compose.ui:ui-tooling")
+}
+
+
+================================================================================
+FILE: app/src/main/AndroidManifest.xml
+================================================================================
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM"/>
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+    <application android:theme="@android:style/Theme.Material.Light.NoActionBar"
+        android:label="Контроль термопечей" android:allowBackup="false">
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+        <service android:name=".FurnaceAlarmService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback"/>
+        <receiver android:name=".AlarmReceiver" android:exported="false"/>
+        <receiver android:name=".BootReceiver" android:enabled="true" android:exported="false">
+            <intent-filter><action android:name="android.intent.action.BOOT_COMPLETED"/></intent-filter>
+        </receiver>
+    </application>
+</manifest>
+
+
+================================================================================
+FILE: app/src/main/java/com/example/furnacecontrol/AlarmReceiver.kt
+================================================================================
+package com.example.furnacecontrol
+
+import android.app.AlarmManager
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.media.AudioAttributes
+import android.media.RingtoneManager
+import android.media.MediaPlayer
+import android.net.Uri
+import android.os.PowerManager
+import android.os.Build
+import android.os.IBinder
+import androidx.core.app.NotificationCompat
+
+object AlarmHelper {
+    private const val CHANNEL = "furnace_finished"
+    private const val PREFS = "furnace_preferences"
+    private const val SOUND_URI = "alarm_sound_uri"
+
+    fun getSelectedSound(context: Context): String = context.getSharedPreferences(PREFS, 0)
+        .getString(SOUND_URI, RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)?.toString().orEmpty()).orEmpty()
+
+    fun setSelectedSound(context: Context, uri: String) {
+        context.getSharedPreferences(PREFS, 0).edit().putString(SOUND_URI, uri).apply()
+    }
+
+    fun schedule(context: Context, timer: FurnaceTimer) {
+        if (!timer.running) return
+        val intent = Intent(context, AlarmReceiver::class.java).putExtra("furnace_id", timer.id)
+        val pi = PendingIntent.getBroadcast(context, timer.id, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        try {
+            am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, timer.endAt, pi)
+        } catch (_: SecurityException) {
+            am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, timer.endAt, pi)
+        }
+    }
+
+    fun cancel(context: Context, id: Int) {
+        val pi = PendingIntent.getBroadcast(context, id,
+            Intent(context, AlarmReceiver::class.java).putExtra("furnace_id", id),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        (context.getSystemService(Context.ALARM_SERVICE) as AlarmManager).cancel(pi)
+    }
+
+    fun ensureChannel(context: Context) {
+        if (Build.VERSION.SDK_INT >= 26) {
+            val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val channel = NotificationChannel(CHANNEL, "Окончание обработки",
+                NotificationManager.IMPORTANCE_HIGH).apply {
+                setSound(null, null) // Звук воспроизводит отдельный сервис до подтверждения
+                enableVibration(true)
+                setShowBadge(true)
+            }
+            manager.createNotificationChannel(channel)
+        }
+    }
+
+    fun startRinging(context: Context) {
+        val intent = Intent(context, FurnaceAlarmService::class.java)
+        if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent)
+        else context.startService(intent)
+    }
+
+    fun stopRinging(context: Context) {
+        context.stopService(Intent(context, FurnaceAlarmService::class.java))
+    }
+
+    fun refreshRinging(context: Context) {
+        val anyWaiting = TimerStore.load(context).any { it.completed }
+        if (anyWaiting) startRinging(context) else stopRinging(context)
+    }
+
+    fun notification(context: Context) = NotificationCompat.Builder(context, CHANNEL)
+        .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+        .setContentTitle("Требуется выгрузка")
+        .setContentText("Есть печь, ожидающая подтверждения оператора")
+        .setPriority(NotificationCompat.PRIORITY_MAX)
+        .setCategory(NotificationCompat.CATEGORY_ALARM)
+        .setOngoing(true)
+        .setOnlyAlertOnce(true)
+        .build()
+}
+
+class AlarmReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        val id = intent.getIntExtra("furnace_id", -1)
+        val timer = TimerStore.load(context).firstOrNull { it.id == id } ?: return
+        if (!timer.running || timer.endAt > System.currentTimeMillis()) return
+        val finished = timer.copy(completed = true)
+        TimerStore.update(context, id) { finished }
+        AlarmHelper.ensureChannel(context)
+        AlarmHelper.startRinging(context)
+    }
+}
+
+class BootReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
+        TimerStore.load(context).forEach { timer ->
+            if (timer.running) {
+                if (timer.endAt <= System.currentTimeMillis()) {
+                    TimerStore.update(context, timer.id) { it.copy(completed = true) }
+                } else AlarmHelper.schedule(context, timer)
+            }
+        }
+        AlarmHelper.refreshRinging(context)
+    }
+}
+
+class FurnaceAlarmService : Service() {
+    private var player: MediaPlayer? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        AlarmHelper.ensureChannel(this)
+        startForeground(9000, AlarmHelper.notification(this))
+        val power = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "FurnaceControl:Alarm")
+            .apply { setReferenceCounted(false); acquire() }
+        startAlarmSound()
+    }
+
+    private fun startAlarmSound() {
+        try {
+            val sound = AlarmHelper.getSelectedSound(this)
+            val uri = sound.takeIf { it.isNotBlank() }?.let(Uri::parse)
+                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+            if (uri == null) return
+            player = MediaPlayer().apply {
+                setAudioAttributes(AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ALARM)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build())
+                setDataSource(this@FurnaceAlarmService, uri)
+                isLooping = true
+                setOnPreparedListener { it.start() }
+                prepareAsync()
+            }
+        } catch (_: Exception) {
+            // Если выбранный системный звук недоступен, пробуем стандартный сигнал будильника.
+            try {
+                val fallback = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM) ?: return
+                player?.release()
+                player = MediaPlayer().apply {
+                    setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build())
+                    setDataSource(this@FurnaceAlarmService, fallback)
+                    isLooping = true
+                    setOnPreparedListener { it.start() }
+                    prepareAsync()
+                }
+            } catch (_: Exception) { }
+        }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (TimerStore.load(this).none { it.completed }) stopSelf()
+        return START_STICKY
+    }
+
+    override fun onDestroy() {
+        try { player?.stop() } catch (_: Exception) { }
+        player?.release()
+        player = null
+        if (wakeLock?.isHeld == true) wakeLock?.release()
+        wakeLock = null
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+}
+
+
+================================================================================
+FILE: app/src/main/java/com/example/furnacecontrol/MainActivity.kt
+================================================================================
+package com.example.furnacecontrol
+
+import android.Manifest
+import android.content.Intent
+import android.media.RingtoneManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
+import java.util.Locale
+
+class MainActivity : ComponentActivity() {
+    private val notificationPermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()) { }
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        if (Build.VERSION.SDK_INT >= 33) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        setContent { FurnaceScreen() }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun FurnaceScreen() {
+    val context = LocalContext.current
+    var timers by remember { mutableStateOf(TimerStore.load(context)) }
+    var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    var selected by remember { mutableStateOf<FurnaceTimer?>(null) }
+    var durationMinutes by remember { mutableStateOf("60") }
+    var selectedSound by remember { mutableStateOf(AlarmHelper.getSelectedSound(context)) }
+    val soundPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val picked = result.data?.getParcelableExtra<Uri>(RingtoneManager.EXTRA_RINGTONE_PICKED_URI)
+        if (result.resultCode == android.app.Activity.RESULT_OK && picked != null) {
+            selectedSound = picked.toString()
+            AlarmHelper.setSelectedSound(context, selectedSound)
+        }
+    }
+    val selectedSoundName = remember(selectedSound) {
+        try {
+            RingtoneManager.getRingtone(context, Uri.parse(selectedSound))?.getTitle(context)
+                ?: "Сигнал будильника по умолчанию"
+        } catch (_: Exception) { "Сигнал будильника по умолчанию" }
+    }
+    var renameTarget by remember { mutableStateOf<FurnaceTimer?>(null) }
+    var newName by remember { mutableStateOf("") }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(1000)
+            now = System.currentTimeMillis()
+            timers = TimerStore.load(context)
+        }
+    }
+
+    MaterialTheme {
+        Scaffold(topBar = { TopAppBar(title = { Text("Контроль термопечей") }) }) { padding ->
+            Column(Modifier.padding(padding).padding(16.dp)) {
+                Text("8 печей · таймеры работают независимо", style = MaterialTheme.typography.bodyMedium)
+                Spacer(Modifier.height(12.dp))
+                LazyVerticalGrid(columns = GridCells.Fixed(2), verticalArrangement = Arrangement.spacedBy(10.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    items(timers, key = { it.id }) { timer ->
+                        val remaining = (timer.endAt - now).coerceAtLeast(0L) / 1000L
+                        val time = String.format(Locale.getDefault(), "%02d:%02d:%02d",
+                            remaining / 3600, (remaining % 3600) / 60, remaining % 60)
+                        Card {
+                            Column(Modifier.padding(12.dp)) {
+                                Text(timer.name, style = MaterialTheme.typography.titleMedium)
+                                Spacer(Modifier.height(6.dp))
+                                when {
+                                    timer.running -> {
+                                        if (remaining == 0L) {
+                                            Text("ЗАВЕРШЕНИЕ…", style = MaterialTheme.typography.titleLarge,
+                                                color = MaterialTheme.colorScheme.error)
+                                        } else {
+                                            Text(time, style = MaterialTheme.typography.headlineSmall,
+                                                color = MaterialTheme.colorScheme.primary)
+                                        }
+                                        Text("В работе")
+                                        Spacer(Modifier.height(8.dp))
+                                        OutlinedButton(onClick = {
+                                            AlarmHelper.cancel(context, timer.id)
+                                            TimerStore.update(context, timer.id) { it.copy(endAt = 0L, completed = false) }
+                                            AlarmHelper.refreshRinging(context)
+                                            timers = TimerStore.load(context)
+                                        }) { Text("Остановить") }
+                                    }
+                                    timer.completed -> {
+                                        Text("ВРЕМЯ ВЫШЛО", color = MaterialTheme.colorScheme.error)
+                                        Button(onClick = {
+                                            TimerStore.update(context, timer.id) { it.copy(endAt = 0L, completed = false) }
+                                            AlarmHelper.refreshRinging(context)
+                                            timers = TimerStore.load(context)
+                                        }) { Text("Выгружено") }
+                                    }
+                                    else -> {
+                                        Text("Свободна")
+                                        Button(onClick = { selected = timer }) { Text("Загрузить") }
+                                    }
+                                }
+                                TextButton(onClick = { renameTarget = timer; newName = timer.name }) {
+                                    Text("Изменить название")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        selected?.let { timer ->
+            AlertDialog(
+                onDismissRequest = { selected = null },
+                title = { Text("Время обработки · ${timer.name}") },
+                text = {
+                    Column {
+                        OutlinedTextField(
+                            value = durationMinutes,
+                            onValueChange = { durationMinutes = it.filter(Char::isDigit).take(7) },
+                            label = { Text("Время обработки, минут") },
+                            singleLine = true
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        Text("Мелодия сигнала: $selectedSoundName")
+                        OutlinedButton(onClick = {
+                            val pickIntent = Intent(RingtoneManager.ACTION_RINGTONE_PICKER).apply {
+                                putExtra(RingtoneManager.EXTRA_RINGTONE_TYPE, RingtoneManager.TYPE_ALARM)
+                                putExtra(RingtoneManager.EXTRA_RINGTONE_TITLE, "Выберите мелодию сигнала")
+                                putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_DEFAULT, true)
+                                putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_SILENT, false)
+                                putExtra(RingtoneManager.EXTRA_RINGTONE_EXISTING_URI,
+                                    selectedSound.takeIf { it.isNotBlank() }?.let(Uri::parse))
+                            }
+                            soundPicker.launch(pickIntent)
+                        }) { Text("Выбрать мелодию") }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        val total = durationMinutes.toLongOrNull() ?: 0L
+                        if (total > 0) {
+                            val started = timer.copy(endAt = System.currentTimeMillis() + total * 60_000L,
+                                completed = false)
+                            TimerStore.update(context, timer.id) { started }
+                            AlarmHelper.schedule(context, started)
+                            timers = TimerStore.load(context)
+                            selected = null
+                        }
+                    }) { Text("Запустить") }
+                },
+                dismissButton = { TextButton(onClick = { selected = null }) { Text("Отмена") } }
+            )
+        }
+
+        renameTarget?.let { timer ->
+            AlertDialog(
+                onDismissRequest = { renameTarget = null },
+                title = { Text("Название печи") },
+                text = { OutlinedTextField(newName, { newName = it }, label = { Text("Название") }) },
+                confirmButton = {
+                    TextButton(onClick = {
+                        if (newName.isNotBlank()) {
+                            TimerStore.update(context, timer.id) { it.copy(name = newName.trim()) }
+                            timers = TimerStore.load(context)
+                        }
+                        renameTarget = null
+                    }) { Text("Сохранить") }
+                },
+                dismissButton = { TextButton(onClick = { renameTarget = null }) { Text("Отмена") } }
+            )
+        }
+    }
+}
+
+
+================================================================================
+FILE: app/src/main/java/com/example/furnacecontrol/TimerStore.kt
+================================================================================
+package com.example.furnacecontrol
+
+import android.content.Context
+import org.json.JSONArray
+import org.json.JSONObject
+
+data class FurnaceTimer(
+    val id: Int,
+    val name: String,
+    val endAt: Long = 0L,
+    val completed: Boolean = false
+) {
+    val running: Boolean get() = endAt > 0L && !completed
+}
+
+object TimerStore {
+    private const val PREFS = "furnace_state"
+    private const val KEY = "timers"
+
+    fun load(context: Context): List<FurnaceTimer> {
+        val raw = context.getSharedPreferences(PREFS, 0).getString(KEY, null)
+        if (raw == null) return (1..8).map { FurnaceTimer(it, "Печь $it") }
+        return try {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                FurnaceTimer(o.getInt("id"), o.getString("name"),
+                    o.optLong("endAt", 0L), o.optBoolean("completed", false))
+            }
+        } catch (_: Exception) {
+            (1..8).map { FurnaceTimer(it, "Печь $it") }
+        }
+    }
+
+    fun save(context: Context, timers: List<FurnaceTimer>) {
+        val arr = JSONArray()
+        timers.forEach {
+            arr.put(JSONObject().put("id", it.id).put("name", it.name)
+                .put("endAt", it.endAt).put("completed", it.completed))
+        }
+        context.getSharedPreferences(PREFS, 0).edit().putString(KEY, arr.toString()).apply()
+    }
+
+    fun update(context: Context, id: Int, transform: (FurnaceTimer) -> FurnaceTimer) {
+        val updated = load(context).map { if (it.id == id) transform(it) else it }
+        save(context, updated)
+    }
+}
+
+
+================================================================================
+FILE: build.gradle.kts
+================================================================================
+plugins {
+    id("com.android.application") version "8.13.2" apply false
+    id("org.jetbrains.kotlin.android") version "2.2.20" apply false
+    id("org.jetbrains.kotlin.plugin.compose") version "2.2.20" apply false
+}
+
+
+================================================================================
+FILE: gradle.properties
+================================================================================
+org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+android.useAndroidX=true
+kotlin.code.style=official
+
+
+================================================================================
+FILE: settings.gradle.kts
+================================================================================
+pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories { google(); mavenCentral() }
+}
+rootProject.name = "HeatFurnaceControl"
+include(":app")
+
